@@ -8,12 +8,7 @@
  */
 
 import type {DOMEventName} from './DOMEventNames';
-import {
-  type EventSystemFlags,
-  SHOULD_NOT_DEFER_CLICK_FOR_FB_SUPPORT_MODE,
-  IS_LEGACY_FB_SUPPORT_MODE,
-  SHOULD_NOT_PROCESS_POLYFILL_EVENT_PLUGINS,
-} from './EventSystemFlags';
+import type {EventSystemFlags} from './EventSystemFlags';
 import type {AnyNativeEvent} from './PluginModuleType';
 import type {
   KnownReactSyntheticEvent,
@@ -23,6 +18,9 @@ import type {Fiber} from 'react-reconciler/src/ReactInternalTypes';
 
 import {allNativeEvents} from './EventRegistry';
 import {
+  SHOULD_NOT_DEFER_CLICK_FOR_FB_SUPPORT_MODE,
+  IS_LEGACY_FB_SUPPORT_MODE,
+  SHOULD_NOT_PROCESS_POLYFILL_EVENT_PLUGINS,
   IS_CAPTURE_PHASE,
   IS_EVENT_HANDLE_NON_MANAGED_NODE,
   IS_NON_DELEGATED,
@@ -33,6 +31,8 @@ import {
   HostRoot,
   HostPortal,
   HostComponent,
+  HostResource,
+  HostSingleton,
   HostText,
   ScopeComponent,
 } from 'react-reconciler/src/ReactWorkTags';
@@ -43,7 +43,7 @@ import {
   getEventListenerSet,
   getEventHandlerListeners,
 } from '../client/ReactDOMComponentTree';
-import {COMMENT_NODE} from '../shared/HTMLNodeType';
+import {COMMENT_NODE, DOCUMENT_NODE} from '../shared/HTMLNodeType';
 import {batchedUpdates} from './ReactDOMUpdateBatching';
 import getListener from './getListener';
 import {passiveBrowserEventsSupported} from './checkPassiveEvents';
@@ -52,12 +52,13 @@ import {
   enableLegacyFBSupport,
   enableCreateEventHandleAPI,
   enableScopeAPI,
+  enableFloat,
+  enableHostSingletons,
 } from 'shared/ReactFeatureFlags';
 import {
   invokeGuardedCallbackAndCatchFirstError,
   rethrowCaughtError,
 } from 'shared/ReactErrorUtils';
-import {DOCUMENT_NODE} from '../shared/HTMLNodeType';
 import {createEventListenerWrapperWithPriority} from './ReactDOMEventListener';
 import {
   removeEventListener,
@@ -425,7 +426,7 @@ function addTrappedEventListener(
   );
   // If passive option is not supported, then the event will be
   // active and not passive.
-  let isPassiveListener = undefined;
+  let isPassiveListener: void | boolean = undefined;
   if (passiveBrowserEventsSupported) {
     // Browsers introduced an intervention, making these events
     // passive by default on document. React doesn't bind them
@@ -576,7 +577,7 @@ export function dispatchEventForPluginEventSystem(
       // root boundaries that match that of our current "rootContainer".
       // If we find that "rootContainer", we find the parent fiber
       // sub-tree for that root and make that our ancestor instance.
-      let node = targetInst;
+      let node: null | Fiber = targetInst;
 
       mainLoop: while (true) {
         if (node === null) {
@@ -621,7 +622,12 @@ export function dispatchEventForPluginEventSystem(
               return;
             }
             const parentTag = parentNode.tag;
-            if (parentTag === HostComponent || parentTag === HostText) {
+            if (
+              parentTag === HostComponent ||
+              parentTag === HostText ||
+              (enableFloat ? parentTag === HostResource : false) ||
+              (enableHostSingletons ? parentTag === HostSingleton : false)
+            ) {
               node = ancestorInst = parentNode;
               continue mainLoop;
             }
@@ -675,7 +681,12 @@ export function accumulateSinglePhaseListeners(
   while (instance !== null) {
     const {stateNode, tag} = instance;
     // Handle listeners that are on HostComponents (i.e. <div>)
-    if (tag === HostComponent && stateNode !== null) {
+    if (
+      (tag === HostComponent ||
+        (enableFloat ? tag === HostResource : false) ||
+        (enableHostSingletons ? tag === HostSingleton : false)) &&
+      stateNode !== null
+    ) {
       lastHostComponent = stateNode;
 
       // createEventHandle listeners
@@ -752,7 +763,7 @@ export function accumulateSinglePhaseListeners(
     // current instance fiber. In which case, we should clear all existing
     // listeners.
     if (enableCreateEventHandleAPI && nativeEvent.type === 'beforeblur') {
-      // $FlowFixMe: internal field
+      // $FlowFixMe[prop-missing] internal field
       const detachedInterceptFiber = nativeEvent._detachedInterceptFiber;
       if (
         detachedInterceptFiber !== null &&
@@ -786,7 +797,12 @@ export function accumulateTwoPhaseListeners(
   while (instance !== null) {
     const {stateNode, tag} = instance;
     // Handle listeners that are on HostComponents (i.e. <div>)
-    if (tag === HostComponent && stateNode !== null) {
+    if (
+      (tag === HostComponent ||
+        (enableFloat ? tag === HostResource : false) ||
+        (enableHostSingletons ? tag === HostSingleton : false)) &&
+      stateNode !== null
+    ) {
       const currentTarget = stateNode;
       const captureListener = getListener(instance, captureName);
       if (captureListener != null) {
@@ -811,13 +827,18 @@ function getParent(inst: Fiber | null): Fiber | null {
     return null;
   }
   do {
+    // $FlowFixMe[incompatible-use] found when upgrading Flow
     inst = inst.return;
     // TODO: If this is a HostRoot we might want to bail out.
     // That is depending on if we want nested subtrees (layers) to bubble
     // events to their parent. We could also go through parentNode on the
     // host node but that wouldn't work for React Native and doesn't let us
     // do the portal feature.
-  } while (inst && inst.tag !== HostComponent);
+  } while (
+    inst &&
+    inst.tag !== HostComponent &&
+    (!enableHostSingletons ? true : inst.tag !== HostSingleton)
+  );
   if (inst) {
     return inst;
   }
@@ -829,14 +850,14 @@ function getParent(inst: Fiber | null): Fiber | null {
  * different trees.
  */
 function getLowestCommonAncestor(instA: Fiber, instB: Fiber): Fiber | null {
-  let nodeA = instA;
-  let nodeB = instB;
+  let nodeA: null | Fiber = instA;
+  let nodeB: null | Fiber = instB;
   let depthA = 0;
-  for (let tempA = nodeA; tempA; tempA = getParent(tempA)) {
+  for (let tempA: null | Fiber = nodeA; tempA; tempA = getParent(tempA)) {
     depthA++;
   }
   let depthB = 0;
-  for (let tempB = nodeB; tempB; tempB = getParent(tempB)) {
+  for (let tempB: null | Fiber = nodeB; tempB; tempB = getParent(tempB)) {
     depthB++;
   }
 
@@ -874,7 +895,7 @@ function accumulateEnterLeaveListenersForEvent(
   const registrationName = event._reactName;
   const listeners: Array<DispatchListener> = [];
 
-  let instance = target;
+  let instance: null | Fiber = target;
   while (instance !== null) {
     if (instance === common) {
       break;
@@ -883,7 +904,12 @@ function accumulateEnterLeaveListenersForEvent(
     if (alternate !== null && alternate === common) {
       break;
     }
-    if (tag === HostComponent && stateNode !== null) {
+    if (
+      (tag === HostComponent ||
+        (enableFloat ? tag === HostResource : false) ||
+        (enableHostSingletons ? tag === HostSingleton : false)) &&
+      stateNode !== null
+    ) {
       const currentTarget = stateNode;
       if (inCapturePhase) {
         const captureListener = getListener(instance, registrationName);

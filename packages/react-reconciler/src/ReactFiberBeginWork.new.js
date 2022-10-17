@@ -11,12 +11,12 @@ import type {
   ReactProviderType,
   ReactContext,
   ReactNodeList,
+  MutableSource,
 } from 'shared/ReactTypes';
 import type {LazyComponent as LazyComponentType} from 'react/src/ReactLazy';
 import type {Fiber, FiberRoot} from './ReactInternalTypes';
 import type {TypeOfMode} from './ReactTypeOfMode';
 import type {Lanes, Lane} from './ReactFiberLane.new';
-import type {MutableSource} from 'shared/ReactTypes';
 import type {
   SuspenseState,
   SuspenseListRenderState,
@@ -37,10 +37,6 @@ import type {
 import type {UpdateQueue} from './ReactFiberClassUpdateQueue.new';
 import type {RootState} from './ReactFiberRoot.new';
 import type {TracingMarkerInstance} from './ReactFiberTracingMarkerComponent.new';
-import {
-  enableCPUSuspense,
-  enableUseMutableSource,
-} from 'shared/ReactFeatureFlags';
 
 import checkPropTypes from 'shared/checkPropTypes';
 import {
@@ -54,6 +50,8 @@ import {
   ClassComponent,
   HostRoot,
   HostComponent,
+  HostResource,
+  HostSingleton,
   HostText,
   HostPortal,
   ForwardRef,
@@ -105,6 +103,10 @@ import {
   enableSchedulingProfiler,
   enableTransitionTracing,
   enableLegacyHidden,
+  enableCPUSuspense,
+  enableUseMutableSource,
+  enableFloat,
+  enableHostSingletons,
 } from 'shared/ReactFeatureFlags';
 import isArray from 'shared/isArray';
 import shallowEqual from 'shared/shallowEqual';
@@ -161,7 +163,10 @@ import {
   getSuspenseInstanceFallbackErrorDetails,
   registerSuspenseInstanceRetry,
   supportsHydration,
+  supportsResources,
+  supportsSingletons,
   isPrimaryRenderer,
+  getResource,
 } from './ReactFiberHostConfig';
 import type {SuspenseInstance} from './ReactFiberHostConfig';
 import {shouldError, shouldSuspend} from './ReactFiberReconciler';
@@ -214,6 +219,7 @@ import {
   enterHydrationState,
   reenterHydrationStateFromDehydratedSuspenseInstance,
   resetHydrationState,
+  claimHydratableSingleton,
   tryToClaimNextHydratableInstance,
   warnIfHydrating,
   queueHydrationError,
@@ -588,6 +594,7 @@ function updateSimpleMemoComponent(
         try {
           outerMemoType = init(payload);
         } catch (x) {
+          // $FlowFixMe[incompatible-type] found when upgrading Flow
           outerMemoType = null;
         }
         // Inner propTypes will be validated in the function component path.
@@ -1577,6 +1584,54 @@ function updateHostComponent(
 
   markRef(current, workInProgress);
   reconcileChildren(current, workInProgress, nextChildren, renderLanes);
+  return workInProgress.child;
+}
+
+function updateHostResource(current, workInProgress, renderLanes) {
+  pushHostContext(workInProgress);
+  markRef(current, workInProgress);
+  const currentProps = current === null ? null : current.memoizedProps;
+  workInProgress.memoizedState = getResource(
+    workInProgress.type,
+    workInProgress.pendingProps,
+    currentProps,
+  );
+  reconcileChildren(
+    current,
+    workInProgress,
+    workInProgress.pendingProps.children,
+    renderLanes,
+  );
+  return workInProgress.child;
+}
+
+function updateHostSingleton(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  renderLanes: Lanes,
+) {
+  pushHostContext(workInProgress);
+
+  if (current === null) {
+    claimHydratableSingleton(workInProgress);
+  }
+
+  const nextChildren = workInProgress.pendingProps.children;
+
+  if (current === null && !getIsHydrating()) {
+    // Similar to Portals we append Singleton children in the commit phase. So we
+    // Track insertions even on mount.
+    // TODO: Consider unifying this with how the root works.
+    workInProgress.child = reconcileChildFibers(
+      workInProgress,
+      null,
+      nextChildren,
+      renderLanes,
+    );
+  } else {
+    reconcileChildren(current, workInProgress, nextChildren, renderLanes);
+  }
+  markRef(current, workInProgress);
   return workInProgress.child;
 }
 
@@ -2968,12 +3023,15 @@ function propagateSuspenseContextChange(
     if (node === workInProgress) {
       return;
     }
+    // $FlowFixMe[incompatible-use] found when upgrading Flow
     while (node.sibling === null) {
+      // $FlowFixMe[incompatible-use] found when upgrading Flow
       if (node.return === null || node.return === workInProgress) {
         return;
       }
       node = node.return;
     }
+    // $FlowFixMe[incompatible-use] found when upgrading Flow
     node.sibling.return = node.return;
     node = node.sibling;
   }
@@ -3574,13 +3632,16 @@ function remountFiber(
         // eslint-disable-next-line react-internal/prod-error-codes
         throw new Error('Expected parent to have a child.');
       }
+      // $FlowFixMe[incompatible-use] found when upgrading Flow
       while (prevSibling.sibling !== oldWorkInProgress) {
+        // $FlowFixMe[incompatible-use] found when upgrading Flow
         prevSibling = prevSibling.sibling;
         if (prevSibling === null) {
           // eslint-disable-next-line react-internal/prod-error-codes
           throw new Error('Expected to find the previous sibling.');
         }
       }
+      // $FlowFixMe[incompatible-use] found when upgrading Flow
       prevSibling.sibling = newWorkInProgress;
     }
 
@@ -3651,6 +3712,8 @@ function attemptEarlyBailoutIfNoScheduledUpdate(
       }
       resetHydrationState();
       break;
+    case HostResource:
+    case HostSingleton:
     case HostComponent:
       pushHostContext(workInProgress);
       break;
@@ -3985,6 +4048,16 @@ function beginWork(
     }
     case HostRoot:
       return updateHostRoot(current, workInProgress, renderLanes);
+    case HostResource:
+      if (enableFloat && supportsResources) {
+        return updateHostResource(current, workInProgress, renderLanes);
+      }
+    // eslint-disable-next-line no-fallthrough
+    case HostSingleton:
+      if (enableHostSingletons && supportsSingletons) {
+        return updateHostSingleton(current, workInProgress, renderLanes);
+      }
+    // eslint-disable-next-line no-fallthrough
     case HostComponent:
       return updateHostComponent(current, workInProgress, renderLanes);
     case HostText:

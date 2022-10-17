@@ -7,6 +7,7 @@
  * @flow
  */
 
+import type {EventPriority} from 'react-reconciler/src/ReactEventPriorities';
 import type {DOMEventName} from '../events/DOMEventNames';
 import type {Fiber, FiberRoot} from 'react-reconciler/src/ReactInternalTypes';
 import type {
@@ -23,8 +24,9 @@ import {
   getFiberFromScopeInstance,
   getInstanceFromNode as getInstanceFromNodeDOMTree,
   isContainerMarkedAsRoot,
+  detachDeletedInstance,
 } from './ReactDOMComponentTree';
-export {detachDeletedInstance} from './ReactDOMComponentTree';
+export {detachDeletedInstance};
 import {hasRole} from './DOMAccessibilityRoles';
 import {
   createElement,
@@ -66,14 +68,26 @@ import {
   enableCreateEventHandleAPI,
   enableScopeAPI,
   enableFloat,
+  enableHostSingletons,
 } from 'shared/ReactFeatureFlags';
-import {HostComponent, HostText} from 'react-reconciler/src/ReactWorkTags';
+import {
+  HostComponent,
+  HostResource,
+  HostText,
+  HostSingleton,
+} from 'react-reconciler/src/ReactWorkTags';
 import {listenToAllSupportedEvents} from '../events/DOMPluginEventSystem';
 
 import {DefaultEventPriority} from 'react-reconciler/src/ReactEventPriorities';
 
 // TODO: Remove this deep import when we delete the legacy root API
 import {ConcurrentMode, NoMode} from 'react-reconciler/src/ReactTypeOfMode';
+
+import {
+  prepareToRenderResources,
+  cleanupAfterRenderResources,
+  isHostResourceType,
+} from './ReactDOMFloatClient';
 
 export type Type = string;
 export type Props = {
@@ -107,12 +121,14 @@ export type EventTargetChildElement = {
   ...
 };
 export type Container =
-  | (Element & {_reactRootContainer?: FiberRoot, ...})
-  | (Document & {_reactRootContainer?: FiberRoot, ...})
-  | (DocumentFragment & {_reactRootContainer?: FiberRoot, ...});
+  | interface extends Element {_reactRootContainer?: FiberRoot}
+  | interface extends Document {_reactRootContainer?: FiberRoot}
+  | interface extends DocumentFragment {_reactRootContainer?: FiberRoot};
 export type Instance = Element;
 export type TextInstance = Text;
-export type SuspenseInstance = Comment & {_reactRetry?: () => void, ...};
+export interface SuspenseInstance extends Comment {
+  _reactRetry?: () => void;
+}
 export type HydratableInstance = Instance | TextInstance | SuspenseInstance;
 export type PublicInstance = Element | Text;
 type HostContextDev = {
@@ -197,7 +213,7 @@ export function getChildHostContext(
   return getChildNamespace(parentNamespace, type);
 }
 
-export function getPublicInstance(instance: Instance): * {
+export function getPublicInstance(instance: Instance): Instance {
   return instance;
 }
 
@@ -358,7 +374,7 @@ export function createTextInstance(
   return textNode;
 }
 
-export function getCurrentEventPriority(): * {
+export function getCurrentEventPriority(): EventPriority {
   const currentEvent = window.event;
   if (currentEvent === undefined) {
     return DefaultEventPriority;
@@ -381,6 +397,33 @@ const localRequestAnimationFrame =
   typeof requestAnimationFrame === 'function'
     ? requestAnimationFrame
     : scheduleTimeout;
+
+export function getInstanceFromNode(node: HTMLElement): null | Object {
+  return getClosestInstanceFromNode(node) || null;
+}
+
+export function preparePortalMount(portalInstance: Instance): void {
+  listenToAllSupportedEvents(portalInstance);
+}
+
+export function prepareScopeUpdate(
+  scopeInstance: ReactScopeInstance,
+  internalInstanceHandle: Object,
+): void {
+  if (enableScopeAPI) {
+    precacheFiberNode(internalInstanceHandle, scopeInstance);
+  }
+}
+
+export function getInstanceFromScope(
+  scopeInstance: ReactScopeInstance,
+): null | Object {
+  if (enableScopeAPI) {
+    return getFiberFromScopeInstance(scopeInstance);
+  }
+  return null;
+}
+
 // -------------------
 //     Microtasks
 // -------------------
@@ -580,7 +623,7 @@ export function clearSuspenseBoundary(
   parentInstance: Instance,
   suspenseInstance: SuspenseInstance,
 ): void {
-  let node = suspenseInstance;
+  let node: Node = suspenseInstance;
   // Delete all nodes within this suspense boundary.
   // There might be nested nodes so we need to keep track of how
   // deep we are and only break out when we're back on top.
@@ -607,6 +650,7 @@ export function clearSuspenseBoundary(
         depth++;
       }
     }
+    // $FlowFixMe[incompatible-type] we bail out when we get a null
     node = nextNode;
   } while (node);
   // TODO: Warn, we didn't find the end comment boundary.
@@ -634,6 +678,7 @@ export function hideInstance(instance: Instance): void {
   // pass host context to this method?
   instance = ((instance: any): HTMLElement);
   const style = instance.style;
+  // $FlowFixMe[method-unbinding]
   if (typeof style.setProperty === 'function') {
     style.setProperty('display', 'none', 'important');
   } else {
@@ -665,13 +710,82 @@ export function unhideTextInstance(
 }
 
 export function clearContainer(container: Container): void {
-  if (container.nodeType === ELEMENT_NODE) {
-    ((container: any): Element).textContent = '';
-  } else if (container.nodeType === DOCUMENT_NODE) {
-    if (container.documentElement) {
-      container.removeChild(container.documentElement);
+  if (enableHostSingletons) {
+    // We have refined the container to Element type
+    const nodeType = container.nodeType;
+    if (nodeType === DOCUMENT_NODE || nodeType === ELEMENT_NODE) {
+      switch (container.nodeName) {
+        case '#document':
+        case 'HTML':
+        case 'HEAD':
+        case 'BODY': {
+          let node = container.firstChild;
+          while (node) {
+            const nextNode = node.nextSibling;
+            const nodeName = node.nodeName;
+            switch (nodeName) {
+              case 'HTML':
+              case 'HEAD':
+              case 'BODY': {
+                clearContainer((node: any));
+                // If these singleton instances had previously been rendered with React they
+                // may still hold on to references to the previous fiber tree. We detatch them
+                // prospectiveyl to reset them to a baseline starting state since we cannot create
+                // new instances.
+                detachDeletedInstance((node: any));
+                break;
+              }
+              case 'STYLE': {
+                break;
+              }
+              case 'LINK': {
+                if (
+                  ((node: any): HTMLLinkElement).rel.toLowerCase() ===
+                  'stylesheet'
+                ) {
+                  break;
+                }
+              }
+              // eslint-disable-next-line no-fallthrough
+              default: {
+                container.removeChild(node);
+              }
+            }
+            node = nextNode;
+          }
+          return;
+        }
+        default: {
+          container.textContent = '';
+        }
+      }
+    }
+  } else {
+    if (container.nodeType === ELEMENT_NODE) {
+      // We have refined the container to Element type
+      const element: Element = (container: any);
+      element.textContent = '';
+    } else if (container.nodeType === DOCUMENT_NODE) {
+      // We have refined the container to Document type
+      const doc: Document = (container: any);
+      if (doc.documentElement) {
+        doc.removeChild(doc.documentElement);
+      }
     }
   }
+}
+
+// Making this so we can eventually move all of the instance caching to the commit phase.
+// Currently this is only used to associate fiber and props to instances for hydrating
+// HostSingletons. The reason we need it here is we only want to make this binding on commit
+// because only one fiber can own the instance at a time and render can fail/restart
+export function bindInstance(
+  instance: Instance,
+  props: Props,
+  internalInstanceHandle: mixed,
+) {
+  precacheFiberNode((internalInstanceHandle: any), instance);
+  updateFiberProps(instance, props);
 }
 
 // -------------------
@@ -679,14 +793,6 @@ export function clearContainer(container: Container): void {
 // -------------------
 
 export const supportsHydration = true;
-
-export function isHydratableResource(type: string, props: Props): boolean {
-  return (
-    type === 'link' &&
-    typeof (props: any).precedence === 'string' &&
-    (props: any).rel === 'stylesheet'
-  );
-}
 
 export function canHydrateInstance(
   instance: HydratableInstance,
@@ -761,18 +867,6 @@ export function getSuspenseInstanceFallbackErrorDetails(
       digest,
     };
   }
-
-  // let value = {message: undefined, hash: undefined};
-  // const nextSibling = instance.nextSibling;
-  // if (nextSibling) {
-  //   const dataset = ((nextSibling: any): HTMLTemplateElement).dataset;
-  //   value.message = dataset.msg;
-  //   value.hash = dataset.hash;
-  //   if (__DEV__) {
-  //     value.stack = dataset.stack;
-  //   }
-  // }
-  // return value;
 }
 
 export function registerSuspenseInstanceRetry(
@@ -786,17 +880,56 @@ function getNextHydratable(node) {
   // Skip non-hydratable nodes.
   for (; node != null; node = ((node: any): Node).nextSibling) {
     const nodeType = node.nodeType;
-    if (enableFloat) {
+    if (enableFloat && enableHostSingletons) {
       if (nodeType === ELEMENT_NODE) {
-        if (
-          ((node: any): Element).tagName === 'LINK' &&
-          ((node: any): Element).hasAttribute('data-rprec')
-        ) {
+        const element: Element = (node: any);
+        switch (element.tagName) {
+          case 'LINK': {
+            const linkEl: HTMLLinkElement = (element: any);
+            const rel = linkEl.rel;
+            if (
+              rel === 'preload' ||
+              (rel === 'stylesheet' && linkEl.hasAttribute('data-rprec'))
+            ) {
+              continue;
+            }
+            break;
+          }
+          case 'HTML':
+          case 'HEAD':
+          case 'BODY': {
+            continue;
+          }
+        }
+        break;
+      } else if (nodeType === TEXT_NODE) {
+        break;
+      }
+    } else if (enableFloat) {
+      if (nodeType === ELEMENT_NODE) {
+        const element: Element = (node: any);
+        if (element.tagName === 'LINK') {
+          const linkEl: HTMLLinkElement = (element: any);
+          const rel = linkEl.rel;
+          if (
+            rel === 'preload' ||
+            (rel === 'stylesheet' && linkEl.hasAttribute('data-rprec'))
+          ) {
+            continue;
+          }
+        }
+        break;
+      } else if (nodeType === TEXT_NODE) {
+        break;
+      }
+    } else if (enableHostSingletons) {
+      if (nodeType === ELEMENT_NODE) {
+        const tag: string = (node: any).tagName;
+        if (tag === 'HTML' || tag === 'HEAD' || tag === 'BODY') {
           continue;
         }
         break;
-      }
-      if (nodeType === TEXT_NODE) {
+      } else if (nodeType === TEXT_NODE) {
         break;
       }
     } else {
@@ -903,43 +1036,6 @@ export function hydrateSuspenseInstance(
   precacheFiberNode(internalInstanceHandle, suspenseInstance);
 }
 
-export function getMatchingResourceInstance(
-  type: string,
-  props: Props,
-  rootHostContainer: Container,
-): ?Instance {
-  if (enableFloat) {
-    switch (type) {
-      case 'link': {
-        if (typeof (props: any).href !== 'string') {
-          return null;
-        }
-        const selector = `link[rel="stylesheet"][data-rprec][href="${
-          (props: any).href
-        }"]`;
-        const link = getOwnerDocumentFromRootContainer(
-          rootHostContainer,
-        ).querySelector(selector);
-        if (__DEV__) {
-          const allLinks = getOwnerDocumentFromRootContainer(
-            rootHostContainer,
-          ).querySelectorAll(selector);
-          if (allLinks.length > 1) {
-            console.error(
-              'Stylesheet resources need a unique representation in the DOM while hydrating' +
-                ' and more than one matching DOM Node was found. To fix, ensure you are only' +
-                ' rendering one stylesheet link with an href attribute of "%s".',
-              (props: any).href,
-            );
-          }
-        }
-        return link;
-      }
-    }
-  }
-  return null;
-}
-
 export function getNextHydratableInstanceAfterSuspenseInstance(
   suspenseInstance: SuspenseInstance,
 ): null | HydratableInstance {
@@ -1016,6 +1112,8 @@ export function commitHydratedSuspenseInstance(
   retryIfBlockedOn(suspenseInstance);
 }
 
+// @TODO remove this function once float lands and hydrated tail nodes
+// are controlled by HostSingleton fibers
 export function shouldDeleteUnhydratedTailInstances(
   parentType: string,
 ): boolean {
@@ -1220,31 +1318,9 @@ export function errorHydratingContainer(parentContainer: Container): void {
   }
 }
 
-export function getInstanceFromNode(node: HTMLElement): null | Object {
-  return getClosestInstanceFromNode(node) || null;
-}
-
-export function preparePortalMount(portalInstance: Instance): void {
-  listenToAllSupportedEvents(portalInstance);
-}
-
-export function prepareScopeUpdate(
-  scopeInstance: ReactScopeInstance,
-  internalInstanceHandle: Object,
-): void {
-  if (enableScopeAPI) {
-    precacheFiberNode(internalInstanceHandle, scopeInstance);
-  }
-}
-
-export function getInstanceFromScope(
-  scopeInstance: ReactScopeInstance,
-): null | Object {
-  if (enableScopeAPI) {
-    return getFiberFromScopeInstance(scopeInstance);
-  }
-  return null;
-}
+// -------------------
+//     Test Selectors
+// -------------------
 
 export const supportsTestSelectors = true;
 
@@ -1281,6 +1357,8 @@ export function matchAccessibilityRole(node: Instance, role: string): boolean {
 
 export function getTextContent(fiber: Fiber): string | null {
   switch (fiber.tag) {
+    case HostResource:
+    case HostSingleton:
     case HostComponent:
       let textContent = '';
       const childNodes = fiber.stateNode.childNodes;
@@ -1317,6 +1395,7 @@ export function setFocusIfFocusable(node: Instance): boolean {
   const element = ((node: any): HTMLElement);
   try {
     element.addEventListener('focus', handleFocus);
+    // $FlowFixMe[method-unbinding]
     (element.focus || HTMLElement.prototype.focus).call(element);
   } finally {
     element.removeEventListener('focus', handleFocus);
@@ -1389,4 +1468,173 @@ export function requestPostPaintCallback(callback: (time: number) => void) {
   localRequestAnimationFrame(() => {
     localRequestAnimationFrame(time => callback(time));
   });
+}
+// -------------------
+//     Resources
+// -------------------
+
+export const supportsResources = true;
+
+export {isHostResourceType};
+
+export function prepareRendererToRender(rootContainer: Container) {
+  if (enableFloat) {
+    prepareToRenderResources(rootContainer);
+  }
+}
+
+export function resetRendererAfterRender() {
+  if (enableFloat) {
+    cleanupAfterRenderResources();
+  }
+}
+
+export {
+  getResource,
+  acquireResource,
+  releaseResource,
+} from './ReactDOMFloatClient';
+
+// -------------------
+//     Singletons
+// -------------------
+
+export const supportsSingletons = true;
+
+export function isHostSingletonType(type: string): boolean {
+  return type === 'html' || type === 'head' || type === 'body';
+}
+
+export function resolveSingletonInstance(
+  type: string,
+  props: Props,
+  rootContainerInstance: Container,
+  hostContext: HostContext,
+  validateDOMNestingDev: boolean,
+): Instance {
+  if (__DEV__) {
+    if (validateDOMNestingDev) {
+      const hostContextDev = ((hostContext: any): HostContextDev);
+      validateDOMNesting(type, null, hostContextDev.ancestorInfo);
+    }
+  }
+  const ownerDocument = getOwnerDocumentFromRootContainer(
+    rootContainerInstance,
+  );
+  switch (type) {
+    case 'html': {
+      const documentElement = ownerDocument.documentElement;
+      if (!documentElement) {
+        throw new Error(
+          'React expected an <html> element (document.documentElement) to exist in the Document but one was' +
+            ' not found. React never removes the documentElement for any Document it renders into so' +
+            ' the cause is likely in some other script running on this page.',
+        );
+      }
+      return documentElement;
+    }
+    case 'head': {
+      const head = ownerDocument.head;
+      if (!head) {
+        throw new Error(
+          'React expected a <head> element (document.head) to exist in the Document but one was' +
+            ' not found. React never removes the head for any Document it renders into so' +
+            ' the cause is likely in some other script running on this page.',
+        );
+      }
+      return head;
+    }
+    case 'body': {
+      const body = ownerDocument.body;
+      if (!body) {
+        throw new Error(
+          'React expected a <body> element (document.body) to exist in the Document but one was' +
+            ' not found. React never removes the body for any Document it renders into so' +
+            ' the cause is likely in some other script running on this page.',
+        );
+      }
+      return body;
+    }
+    default: {
+      throw new Error(
+        'resolveSingletonInstance was called with an element type that is not supported. This is a bug in React.',
+      );
+    }
+  }
+}
+
+export function acquireSingletonInstance(
+  type: string,
+  props: Props,
+  instance: Instance,
+  internalInstanceHandle: Object,
+): void {
+  if (__DEV__) {
+    const currentInstanceHandle = getInstanceFromNodeDOMTree(instance);
+    if (currentInstanceHandle) {
+      const tagName = instance.tagName.toLowerCase();
+      console.error(
+        'You are mounting a new %s component when a previous one has not first unmounted. It is an' +
+          ' error to render more than one %s component at a time and attributes and children of these' +
+          ' components will likely fail in unpredictable ways. Please only render a single instance of' +
+          ' <%s> and if you need to mount a new one, ensure any previous ones have unmounted first.',
+        tagName,
+        tagName,
+        tagName,
+      );
+    }
+    switch (type) {
+      case 'html':
+      case 'head':
+      case 'body': {
+        break;
+      }
+      default: {
+        console.error(
+          'acquireSingletonInstance was called with an element type that is not supported. This is a bug in React.',
+        );
+      }
+    }
+  }
+
+  const attributes = instance.attributes;
+  while (attributes.length) {
+    instance.removeAttributeNode(attributes[0]);
+  }
+
+  setInitialProperties(instance, type, props);
+  precacheFiberNode(internalInstanceHandle, instance);
+  updateFiberProps(instance, props);
+}
+
+export function releaseSingletonInstance(instance: Instance): void {
+  const attributes = instance.attributes;
+  while (attributes.length) {
+    instance.removeAttributeNode(attributes[0]);
+  }
+  detachDeletedInstance(instance);
+}
+
+export function clearSingleton(instance: Instance): void {
+  const element: Element = (instance: any);
+  let node = element.firstChild;
+  while (node) {
+    const nextNode = node.nextSibling;
+    const nodeName = node.nodeName;
+    if (getInstanceFromNodeDOMTree(node)) {
+      // retain nodes owned by React
+    } else if (
+      nodeName === 'HEAD' ||
+      nodeName === 'BODY' ||
+      nodeName === 'STYLE' ||
+      (nodeName === 'LINK' &&
+        ((node: any): HTMLLinkElement).rel.toLowerCase() === 'stylesheet')
+    ) {
+      // retain these nodes
+    } else {
+      element.removeChild(node);
+    }
+    node = nextNode;
+  }
+  return;
 }

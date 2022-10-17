@@ -73,7 +73,7 @@ import {
   enableTrustedTypesIntegration,
   enableCustomElementPropertySupport,
   enableClientRenderFallbackOnTextMismatch,
-  enableFloat,
+  enableHostSingletons,
 } from 'shared/ReactFeatureFlags';
 import {
   mediaEventTypes,
@@ -91,7 +91,9 @@ const CHILDREN = 'children';
 const STYLE = 'style';
 const HTML = '__html';
 
-let warnedUnknownTags;
+let warnedUnknownTags: {
+  [key: string]: boolean,
+};
 
 let validatePropertiesInDevelopment;
 let warnForPropDifference;
@@ -313,12 +315,17 @@ function setInitialDOMProperties(
         // textContent on a <textarea> will cause the placeholder to not
         // show within the <textarea> until it has been focused and blurred again.
         // https://github.com/facebook/react/issues/6731#issuecomment-254874553
-        const canSetTextContent = tag !== 'textarea' || nextProp !== '';
+        const canSetTextContent =
+          (!enableHostSingletons || tag !== 'body') &&
+          (tag !== 'textarea' || nextProp !== '');
         if (canSetTextContent) {
           setTextContent(domElement, nextProp);
         }
       } else if (typeof nextProp === 'number') {
-        setTextContent(domElement, '' + nextProp);
+        const canSetTextContent = !enableHostSingletons || tag !== 'body';
+        if (canSetTextContent) {
+          setTextContent(domElement, '' + nextProp);
+        }
       }
     } else if (
       propKey === SUPPRESS_CONTENT_EDITABLE_WARNING ||
@@ -420,7 +427,6 @@ export function createElement(
       const firstChild = ((div.firstChild: any): HTMLScriptElement);
       domElement = div.removeChild(firstChild);
     } else if (typeof props.is === 'string') {
-      // $FlowFixMe `createElement` should be updated for Web Components
       domElement = ownerDocument.createElement(type, {is: props.is});
     } else {
       // Separate else branch instead of using `props.is || undefined` above because of a Firefox bug.
@@ -456,6 +462,7 @@ export function createElement(
     if (namespaceURI === HTML_NAMESPACE) {
       if (
         !isCustomComponentTag &&
+        // $FlowFixMe[method-unbinding]
         Object.prototype.toString.call(domElement) ===
           '[object HTMLUnknownElement]' &&
         !hasOwnProperty.call(warnedUnknownTags, type)
@@ -1019,17 +1026,6 @@ export function diffHydratedProperties(
           : getPropertyInfo(propKey);
       if (rawProps[SUPPRESS_HYDRATION_WARNING] === true) {
         // Don't bother comparing. We're ignoring all these warnings.
-      } else if (
-        enableFloat &&
-        tag === 'link' &&
-        rawProps.rel === 'stylesheet' &&
-        propKey === 'precedence'
-      ) {
-        // @TODO this is a temporary rule while we haven't implemented HostResources yet. This is used to allow
-        // for hydrating Resources (at the moment, stylesheets with a precedence prop) by using a data attribute.
-        // When we implement HostResources there will be no hydration directly so this code can be deleted
-        // $FlowFixMe - Should be inferred as not undefined.
-        extraAttributeNames.delete('data-rprec');
       } else if (
         propKey === SUPPRESS_CONTENT_EDITABLE_WARNING ||
         propKey === SUPPRESS_HYDRATION_WARNING ||

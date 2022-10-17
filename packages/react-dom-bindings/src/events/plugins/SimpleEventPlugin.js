@@ -43,10 +43,12 @@ import {
   accumulateSinglePhaseListeners,
   accumulateEventHandleNonManagedNodeListeners,
 } from '../DOMPluginEventSystem';
-import {IS_EVENT_HANDLE_NON_MANAGED_NODE} from '../EventSystemFlags';
+import {
+  IS_EVENT_HANDLE_NON_MANAGED_NODE,
+  IS_CAPTURE_PHASE,
+} from '../EventSystemFlags';
 
 import getEventCharCode from '../getEventCharCode';
-import {IS_CAPTURE_PHASE} from '../EventSystemFlags';
 
 import {enableCreateEventHandleAPI} from 'shared/ReactFeatureFlags';
 
@@ -173,7 +175,6 @@ function extractEvents(
     );
     if (listeners.length > 0) {
       // Intentionally create event lazily.
-      // $FlowFixMe[incompatible-type]
       const event: ReactSyntheticEvent = new SyntheticEventCtor(
         reactName,
         reactEventType,
@@ -206,7 +207,6 @@ function extractEvents(
     );
     if (listeners.length > 0) {
       // Intentionally create event lazily.
-      // $FlowFixMe[incompatible-type]
       const event: ReactSyntheticEvent = new SyntheticEventCtor(
         reactName,
         reactEventType,

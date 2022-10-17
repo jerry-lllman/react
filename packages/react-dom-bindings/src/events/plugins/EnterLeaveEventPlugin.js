@@ -24,7 +24,12 @@ import {
 } from '../../client/ReactDOMComponentTree';
 import {accumulateEnterLeaveTwoPhaseListeners} from '../DOMPluginEventSystem';
 
-import {HostComponent, HostText} from 'react-reconciler/src/ReactWorkTags';
+import {enableHostSingletons} from 'shared/ReactFeatureFlags';
+import {
+  HostComponent,
+  HostSingleton,
+  HostText,
+} from 'react-reconciler/src/ReactWorkTags';
 import {getNearestMountedFiber} from 'react-reconciler/src/ReactFiberTreeReflection';
 
 function registerEvents() {
@@ -102,9 +107,12 @@ function extractEvents(
     to = related ? getClosestInstanceFromNode((related: any)) : null;
     if (to !== null) {
       const nearestMounted = getNearestMountedFiber(to);
+      const tag = to.tag;
       if (
         to !== nearestMounted ||
-        (to.tag !== HostComponent && to.tag !== HostText)
+        (tag !== HostComponent &&
+          (!enableHostSingletons ? true : tag !== HostSingleton) &&
+          tag !== HostText)
       ) {
         to = null;
       }
@@ -134,8 +142,6 @@ function extractEvents(
   const fromNode = from == null ? win : getNodeFromInstance(from);
   const toNode = to == null ? win : getNodeFromInstance(to);
 
-  // $FlowFixMe[prop-missing]
-  // $FlowFixMe[incompatible-type]
   const leave: KnownReactSyntheticEvent = new SyntheticEventCtor(
     leaveEventType,
     eventTypePrefix + 'leave',
@@ -152,7 +158,6 @@ function extractEvents(
   // the first ancestor. Next time, we will ignore the event.
   const nativeTargetInst = getClosestInstanceFromNode((nativeEventTarget: any));
   if (nativeTargetInst === targetInst) {
-    // $FlowFixMe[prop-missing]
     const enterEvent: KnownReactSyntheticEvent = new SyntheticEventCtor(
       enterEventType,
       eventTypePrefix + 'enter',

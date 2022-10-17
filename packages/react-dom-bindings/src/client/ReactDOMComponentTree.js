@@ -7,6 +7,7 @@
  * @flow
  */
 
+import type {FloatRoot, StyleResource} from './ReactDOMFloatClient';
 import type {Fiber} from 'react-reconciler/src/ReactInternalTypes';
 import type {ReactScopeInstance} from 'shared/ReactTypes';
 import type {
@@ -23,6 +24,8 @@ import type {
 
 import {
   HostComponent,
+  HostResource,
+  HostSingleton,
   HostText,
   HostRoot,
   SuspenseComponent,
@@ -30,7 +33,11 @@ import {
 
 import {getParentSuspenseInstance} from './ReactDOMHostConfig';
 
-import {enableScopeAPI} from 'shared/ReactFeatureFlags';
+import {
+  enableScopeAPI,
+  enableFloat,
+  enableHostSingletons,
+} from 'shared/ReactFeatureFlags';
 
 const randomKey = Math.random()
   .toString(36)
@@ -41,6 +48,7 @@ const internalContainerInstanceKey = '__reactContainer$' + randomKey;
 const internalEventHandlersKey = '__reactEvents$' + randomKey;
 const internalEventHandlerListenersKey = '__reactListeners$' + randomKey;
 const internalEventHandlesSetKey = '__reactHandles$' + randomKey;
+const internalRootNodeStylesSetKey = '__reactStyles$' + randomKey;
 
 export function detachDeletedInstance(node: Instance): void {
   // TODO: This function is only called on host components. I don't think all of
@@ -60,14 +68,17 @@ export function precacheFiberNode(
 }
 
 export function markContainerAsRoot(hostRoot: Fiber, node: Container): void {
+  // $FlowFixMe[prop-missing]
   node[internalContainerInstanceKey] = hostRoot;
 }
 
 export function unmarkContainerAsRoot(node: Container): void {
+  // $FlowFixMe[prop-missing]
   node[internalContainerInstanceKey] = null;
 }
 
 export function isContainerMarkedAsRoot(node: Container): boolean {
+  // $FlowFixMe[prop-missing]
   return !!node[internalContainerInstanceKey];
 }
 
@@ -131,6 +142,7 @@ export function getClosestInstanceFromNode(targetNode: Node): null | Fiber {
           // have had an internalInstanceKey on it.
           // Let's get the fiber associated with the SuspenseComponent
           // as the deepest instance.
+          // $FlowFixMe[prop-missing]
           const targetSuspenseInst = suspenseInstance[internalInstanceKey];
           if (targetSuspenseInst) {
             return targetSuspenseInst;
@@ -162,11 +174,14 @@ export function getInstanceFromNode(node: Node): Fiber | null {
     (node: any)[internalInstanceKey] ||
     (node: any)[internalContainerInstanceKey];
   if (inst) {
+    const tag = inst.tag;
     if (
-      inst.tag === HostComponent ||
-      inst.tag === HostText ||
-      inst.tag === SuspenseComponent ||
-      inst.tag === HostRoot
+      tag === HostComponent ||
+      tag === HostText ||
+      tag === SuspenseComponent ||
+      (enableFloat ? tag === HostResource : false) ||
+      (enableHostSingletons ? tag === HostSingleton : false) ||
+      tag === HostRoot
     ) {
       return inst;
     } else {
@@ -181,7 +196,13 @@ export function getInstanceFromNode(node: Node): Fiber | null {
  * DOM node.
  */
 export function getNodeFromInstance(inst: Fiber): Instance | TextInstance {
-  if (inst.tag === HostComponent || inst.tag === HostText) {
+  const tag = inst.tag;
+  if (
+    tag === HostComponent ||
+    (enableFloat ? tag === HostResource : false) ||
+    (enableHostSingletons ? tag === HostSingleton : false) ||
+    tag === HostText
+  ) {
     // In Fiber this, is just the state node right now. We assume it will be
     // a host component or host text.
     return inst.stateNode;
@@ -255,4 +276,12 @@ export function doesTargetHaveEventHandle(
     return false;
   }
   return eventHandles.has(eventHandle);
+}
+
+export function getStylesFromRoot(root: FloatRoot): Map<string, StyleResource> {
+  let styles = (root: any)[internalRootNodeStylesSetKey];
+  if (!styles) {
+    styles = (root: any)[internalRootNodeStylesSetKey] = new Map();
+  }
+  return styles;
 }

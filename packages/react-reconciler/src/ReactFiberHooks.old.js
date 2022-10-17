@@ -18,6 +18,7 @@ import type {
 } from 'shared/ReactTypes';
 import type {
   Fiber,
+  FiberRoot,
   Dispatcher,
   HookType,
   MemoCache,
@@ -25,8 +26,6 @@ import type {
 } from './ReactInternalTypes';
 import type {Lanes, Lane} from './ReactFiberLane.old';
 import type {HookFlags} from './ReactHookEffectTags';
-import type {FiberRoot} from './ReactInternalTypes';
-import type {Cache} from './ReactFiberCacheComponent.old';
 import type {Flags} from './ReactFiberFlags';
 
 import ReactSharedInternals from 'shared/ReactSharedInternals';
@@ -42,13 +41,20 @@ import {
   enableUseHook,
   enableUseMemoCacheHook,
   enableUseEventHook,
+  enableStrictEffects,
 } from 'shared/ReactFeatureFlags';
 import {
   REACT_CONTEXT_TYPE,
   REACT_SERVER_CONTEXT_TYPE,
+  REACT_MEMO_CACHE_SENTINEL,
 } from 'shared/ReactSymbols';
 
-import {NoMode, ConcurrentMode, DebugTracingMode} from './ReactTypeOfMode';
+import {
+  NoMode,
+  ConcurrentMode,
+  DebugTracingMode,
+  StrictEffectsMode,
+} from './ReactTypeOfMode';
 import {
   NoLane,
   SyncLane,
@@ -81,6 +87,8 @@ import {
   StaticMask as StaticMaskEffect,
   Update as UpdateEffect,
   StoreConsistency,
+  MountLayoutDev as MountLayoutDevEffect,
+  MountPassiveDev as MountPassiveDevEffect,
 } from './ReactFiberFlags';
 import {
   HasEffect as HookHasEffect,
@@ -114,7 +122,7 @@ import {
 } from './ReactMutableSource.old';
 import {logStateUpdateScheduled} from './DebugTracing';
 import {markStateUpdateScheduled} from './ReactFiberDevToolsHook.old';
-import {createCache, CacheContext} from './ReactFiberCacheComponent.old';
+import {createCache} from './ReactFiberCacheComponent.old';
 import {
   createUpdate as createLegacyQueueUpdate,
   enqueueUpdate as enqueueLegacyQueueUpdate,
@@ -379,7 +387,9 @@ function areHookInputsEqual(
       );
     }
   }
+  // $FlowFixMe[incompatible-use] found when upgrading Flow
   for (let i = 0; i < prevDeps.length && i < nextDeps.length; i++) {
+    // $FlowFixMe[incompatible-use] found when upgrading Flow
     if (is(nextDeps[i], prevDeps[i])) {
       continue;
     }
@@ -590,7 +600,22 @@ export function bailoutHooks(
   lanes: Lanes,
 ) {
   workInProgress.updateQueue = current.updateQueue;
-  workInProgress.flags &= ~(PassiveEffect | UpdateEffect);
+  // TODO: Don't need to reset the flags here, because they're reset in the
+  // complete phase (bubbleProperties).
+  if (
+    __DEV__ &&
+    enableStrictEffects &&
+    (workInProgress.mode & StrictEffectsMode) !== NoMode
+  ) {
+    workInProgress.flags &= ~(
+      MountPassiveDevEffect |
+      MountLayoutDevEffect |
+      PassiveEffect |
+      UpdateEffect
+    );
+  } else {
+    workInProgress.flags &= ~(PassiveEffect | UpdateEffect);
+  }
   current.lanes = removeLanes(current.lanes, lanes);
 }
 
@@ -745,6 +770,7 @@ if (enableUseMemoCacheHook) {
 
 function use<T>(usable: Usable<T>): T {
   if (usable !== null && typeof usable === 'object') {
+    // $FlowFixMe[method-unbinding]
     if (typeof usable.then === 'function') {
       // This is a thenable.
       const thenable: Thenable<T> = (usable: any);
@@ -820,8 +846,6 @@ function useMemoCache(size: number): Array<any> {
     memoCache = updateQueue.memoCache;
   }
   // Otherwise clone from the current fiber
-  // TODO: not sure how to access the current fiber here other than going through
-  // currentlyRenderingFiber.alternate
   if (memoCache == null) {
     const current: Fiber | null = currentlyRenderingFiber.alternate;
     if (current !== null) {
@@ -853,6 +877,9 @@ function useMemoCache(size: number): Array<any> {
   let data = memoCache.data[memoCache.index];
   if (data === undefined) {
     data = memoCache.data[memoCache.index] = new Array(size);
+    for (let i = 0; i < size; i++) {
+      data[i] = REACT_MEMO_CACHE_SENTINEL;
+    }
   } else if (data.length !== size) {
     // TODO: consider warning or throwing here
     if (__DEV__) {
@@ -1859,12 +1886,25 @@ function mountEffect(
   create: () => (() => void) | void,
   deps: Array<mixed> | void | null,
 ): void {
-  return mountEffectImpl(
-    PassiveEffect | PassiveStaticEffect,
-    HookPassive,
-    create,
-    deps,
-  );
+  if (
+    __DEV__ &&
+    enableStrictEffects &&
+    (currentlyRenderingFiber.mode & StrictEffectsMode) !== NoMode
+  ) {
+    return mountEffectImpl(
+      MountPassiveDevEffect | PassiveEffect | PassiveStaticEffect,
+      HookPassive,
+      create,
+      deps,
+    );
+  } else {
+    return mountEffectImpl(
+      PassiveEffect | PassiveStaticEffect,
+      HookPassive,
+      create,
+      deps,
+    );
+  }
 }
 
 function updateEffect(
@@ -1904,6 +1944,7 @@ function mountEvent<Args, Return, F: (...Array<Args>) => Return>(
         "A function wrapped in useEvent can't be called during rendering.",
       );
     }
+    // $FlowFixMe[prop-missing] found when upgrading Flow
     return eventFn._impl.apply(undefined, arguments);
   };
   eventFn._impl = callback;
@@ -1940,7 +1981,14 @@ function mountLayoutEffect(
   create: () => (() => void) | void,
   deps: Array<mixed> | void | null,
 ): void {
-  const fiberFlags: Flags = UpdateEffect | LayoutStaticEffect;
+  let fiberFlags: Flags = UpdateEffect | LayoutStaticEffect;
+  if (
+    __DEV__ &&
+    enableStrictEffects &&
+    (currentlyRenderingFiber.mode & StrictEffectsMode) !== NoMode
+  ) {
+    fiberFlags |= MountLayoutDevEffect;
+  }
   return mountEffectImpl(fiberFlags, HookLayout, create, deps);
 }
 
@@ -2000,7 +2048,14 @@ function mountImperativeHandle<T>(
   const effectDeps =
     deps !== null && deps !== undefined ? deps.concat([ref]) : null;
 
-  const fiberFlags: Flags = UpdateEffect | LayoutStaticEffect;
+  let fiberFlags: Flags = UpdateEffect | LayoutStaticEffect;
+  if (
+    __DEV__ &&
+    enableStrictEffects &&
+    (currentlyRenderingFiber.mode & StrictEffectsMode) !== NoMode
+  ) {
+    fiberFlags |= MountLayoutDevEffect;
+  }
   return mountEffectImpl(
     fiberFlags,
     HookLayout,
@@ -2546,27 +2601,6 @@ function markUpdateInDevTools<A>(fiber, lane, action: A) {
   }
 }
 
-function getCacheSignal(): AbortSignal {
-  if (!enableCache) {
-    throw new Error('Not implemented.');
-  }
-  const cache: Cache = readContext(CacheContext);
-  return cache.controller.signal;
-}
-
-function getCacheForType<T>(resourceType: () => T): T {
-  if (!enableCache) {
-    throw new Error('Not implemented.');
-  }
-  const cache: Cache = readContext(CacheContext);
-  let cacheForType: T | void = (cache.data.get(resourceType): any);
-  if (cacheForType === undefined) {
-    cacheForType = resourceType();
-    cache.data.set(resourceType, cacheForType);
-  }
-  return cacheForType;
-}
-
 export const ContextOnlyDispatcher: Dispatcher = {
   readContext,
 
@@ -2590,8 +2624,6 @@ export const ContextOnlyDispatcher: Dispatcher = {
   unstable_isNewReconciler: enableNewReconciler,
 };
 if (enableCache) {
-  (ContextOnlyDispatcher: Dispatcher).getCacheSignal = getCacheSignal;
-  (ContextOnlyDispatcher: Dispatcher).getCacheForType = getCacheForType;
   (ContextOnlyDispatcher: Dispatcher).useCacheRefresh = throwInvalidHookError;
 }
 if (enableUseHook) {
@@ -2627,8 +2659,6 @@ const HooksDispatcherOnMount: Dispatcher = {
   unstable_isNewReconciler: enableNewReconciler,
 };
 if (enableCache) {
-  (HooksDispatcherOnMount: Dispatcher).getCacheSignal = getCacheSignal;
-  (HooksDispatcherOnMount: Dispatcher).getCacheForType = getCacheForType;
   // $FlowFixMe[escaped-generic] discovered when updating Flow
   (HooksDispatcherOnMount: Dispatcher).useCacheRefresh = mountRefresh;
 }
@@ -2664,8 +2694,6 @@ const HooksDispatcherOnUpdate: Dispatcher = {
   unstable_isNewReconciler: enableNewReconciler,
 };
 if (enableCache) {
-  (HooksDispatcherOnUpdate: Dispatcher).getCacheSignal = getCacheSignal;
-  (HooksDispatcherOnUpdate: Dispatcher).getCacheForType = getCacheForType;
   (HooksDispatcherOnUpdate: Dispatcher).useCacheRefresh = updateRefresh;
 }
 if (enableUseMemoCacheHook) {
@@ -2701,8 +2729,6 @@ const HooksDispatcherOnRerender: Dispatcher = {
   unstable_isNewReconciler: enableNewReconciler,
 };
 if (enableCache) {
-  (HooksDispatcherOnRerender: Dispatcher).getCacheSignal = getCacheSignal;
-  (HooksDispatcherOnRerender: Dispatcher).getCacheForType = getCacheForType;
   (HooksDispatcherOnRerender: Dispatcher).useCacheRefresh = updateRefresh;
 }
 if (enableUseHook) {
@@ -2881,8 +2907,6 @@ if (__DEV__) {
     unstable_isNewReconciler: enableNewReconciler,
   };
   if (enableCache) {
-    (HooksDispatcherOnMountInDEV: Dispatcher).getCacheSignal = getCacheSignal;
-    (HooksDispatcherOnMountInDEV: Dispatcher).getCacheForType = getCacheForType;
     (HooksDispatcherOnMountInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
       currentHookNameInDev = 'useCacheRefresh';
       mountHookTypesDev();
@@ -3040,8 +3064,6 @@ if (__DEV__) {
     unstable_isNewReconciler: enableNewReconciler,
   };
   if (enableCache) {
-    (HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher).getCacheSignal = getCacheSignal;
-    (HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher).getCacheForType = getCacheForType;
     (HooksDispatcherOnMountWithHookTypesInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
       currentHookNameInDev = 'useCacheRefresh';
       updateHookTypesDev();
@@ -3199,8 +3221,6 @@ if (__DEV__) {
     unstable_isNewReconciler: enableNewReconciler,
   };
   if (enableCache) {
-    (HooksDispatcherOnUpdateInDEV: Dispatcher).getCacheSignal = getCacheSignal;
-    (HooksDispatcherOnUpdateInDEV: Dispatcher).getCacheForType = getCacheForType;
     (HooksDispatcherOnUpdateInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
       currentHookNameInDev = 'useCacheRefresh';
       updateHookTypesDev();
@@ -3359,8 +3379,6 @@ if (__DEV__) {
     unstable_isNewReconciler: enableNewReconciler,
   };
   if (enableCache) {
-    (HooksDispatcherOnRerenderInDEV: Dispatcher).getCacheSignal = getCacheSignal;
-    (HooksDispatcherOnRerenderInDEV: Dispatcher).getCacheForType = getCacheForType;
     (HooksDispatcherOnRerenderInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
       currentHookNameInDev = 'useCacheRefresh';
       updateHookTypesDev();
@@ -3535,8 +3553,6 @@ if (__DEV__) {
     unstable_isNewReconciler: enableNewReconciler,
   };
   if (enableCache) {
-    (InvalidNestedHooksDispatcherOnMountInDEV: Dispatcher).getCacheSignal = getCacheSignal;
-    (InvalidNestedHooksDispatcherOnMountInDEV: Dispatcher).getCacheForType = getCacheForType;
     (InvalidNestedHooksDispatcherOnMountInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
       currentHookNameInDev = 'useCacheRefresh';
       mountHookTypesDev();
@@ -3722,8 +3738,6 @@ if (__DEV__) {
     unstable_isNewReconciler: enableNewReconciler,
   };
   if (enableCache) {
-    (InvalidNestedHooksDispatcherOnUpdateInDEV: Dispatcher).getCacheSignal = getCacheSignal;
-    (InvalidNestedHooksDispatcherOnUpdateInDEV: Dispatcher).getCacheForType = getCacheForType;
     (InvalidNestedHooksDispatcherOnUpdateInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
       currentHookNameInDev = 'useCacheRefresh';
       updateHookTypesDev();
@@ -3910,8 +3924,6 @@ if (__DEV__) {
     unstable_isNewReconciler: enableNewReconciler,
   };
   if (enableCache) {
-    (InvalidNestedHooksDispatcherOnRerenderInDEV: Dispatcher).getCacheSignal = getCacheSignal;
-    (InvalidNestedHooksDispatcherOnRerenderInDEV: Dispatcher).getCacheForType = getCacheForType;
     (InvalidNestedHooksDispatcherOnRerenderInDEV: Dispatcher).useCacheRefresh = function useCacheRefresh() {
       currentHookNameInDev = 'useCacheRefresh';
       updateHookTypesDev();
